@@ -8,5 +8,5 @@ spec:
     spec:
       containers:
       # Change the value of image field below to your controller image URL
-      - image: public.ecr.aws/edenlabllc/cluster-api-provider-aws:latest
+      - image: public.ecr.aws/edenlabllc/cluster-api-provider-aws:v2.8.3
         name: manager
