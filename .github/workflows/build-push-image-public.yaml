@@ -1,0 +1,98 @@
+name: Build and push Docker image to ECR (public)
+
+on:
+  push:
+    branches:
+      - release-*
+
+permissions:
+  contents: write
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: public.ecr.aws/edenlabllc
+  GORELEASER: hack/tools/bin/goreleaser
+  GORELEASER_CONFIG: .goreleaser.yaml
+  IMAGE_ARCH: amd64
+  IMAGE_NAME: core.cluster-api-provider-aws
+  RELEASE_DIR: out
+
+jobs:
+  ci:
+    name: Build and push Docker image to ECR
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout main repository
+        uses: actions/checkout@v4
+        with:
+          # fetch only single commit (default)
+          fetch-depth: 1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.CORE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.CORE_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Parse release version from Git commit history
+        run: |
+          echo "Git commit message:"
+          GIT_COMMIT_MSG="$(git log -1 --pretty=format:"%s")"
+          echo "${GIT_COMMIT_MSG}"
+          
+          VERSION_REGEX="^Merge pull request #[0-9]+ from ${GITHUB_REPOSITORY_OWNER}/release/(v[0-9]+\.[0-9]+\.[0-9]+)$"
+          if [[ ! "${GIT_COMMIT_MSG}" =~ ${VERSION_REGEX} ]]; then
+            >&2 echo "Pushes to master should be done via merges of PR requests from release branches only."
+            >&2 echo "  release branch - release/vN.N.N"
+            >&2 echo "The expected message format (will be used for parsing a release tag):"
+            >&2 echo "Merge pull request #N from ${GITHUB_REPOSITORY_OWNER}/release/vN.N.N"
+            exit 1
+          fi
+          
+          VERSION="${BASH_REMATCH[1]}"
+          
+          # export vars required by the next steps
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+
+      - name: Build and push Docker image
+        run: |
+          # export vars required by Makefile
+          export CORE_CONTROLLER_IMG="${ECR_REPOSITORY}/${IMAGE_NAME}"
+          export ARCH="${IMAGE_ARCH}"
+          export TAG="${VERSION}"
+          
+          make docker-build
+
+          readonly SOURCE_IMAGE="${ECR_REPOSITORY}/${IMAGE_NAME}-${IMAGE_ARCH}:${VERSION}"
+          readonly TARGET_IMAGE="${ECR_REPOSITORY}/${IMAGE_NAME}:${VERSION}"
+          docker tag "${SOURCE_IMAGE}" "${TARGET_IMAGE}"
+          docker push "${TARGET_IMAGE}"
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # generate additional release assets and save them to local directories
+
+          # export vars required by Makefile
+          export CORE_CONTROLLER_IMG="${ECR_REPOSITORY}/${IMAGE_NAME}"
+          CHANGELOG_FILE="${RELEASE_DIR}/CHANGELOG.md"
+          
+          make check-release-tag
+          make "${RELEASE_DIR}"
+          make "${GORELEASER}"
+          
+          git checkout "${RELEASE_TAG}"
+          
+          make release-manifests
+          make release-policies
+          
+          echo "Release ${RELEASE_TAG}" > "${CHANGELOG_FILE}"
+          "${GORELEASER}" release --config "${GORELEASER_CONFIG}" --release-notes "${CHANGELOG_FILE}" --clean
