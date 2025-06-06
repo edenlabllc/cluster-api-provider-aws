@@ -11,6 +11,8 @@ permissions:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: public.ecr.aws/edenlabllc
+  GIT_USERNAME: github-actions
+  GIT_EMAIL: github-actions@github.com
   GORELEASER: hack/tools/bin/goreleaser
   GORELEASER_CONFIG: .goreleaser.yaml
   IMAGE_ARCH: amd64
@@ -83,7 +85,11 @@ jobs:
           export CORE_CONTROLLER_IMG="${ECR_REPOSITORY}/${IMAGE_NAME}"
           CHANGELOG_FILE="${RELEASE_DIR}/CHANGELOG.md"
           
+          # prepare Git
+          git config user.name "${GIT_USERNAME}"
+          git config user.email "${GIT_EMAIL}"
           git tag -m "${VERSION}" "${VERSION}"
+          
           make check-release-tag
           make "${RELEASE_DIR}"
           make "${GORELEASER}"
