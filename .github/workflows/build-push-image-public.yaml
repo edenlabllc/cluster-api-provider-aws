@@ -85,11 +85,10 @@ jobs:
           export CORE_CONTROLLER_IMG="${ECR_REPOSITORY}/${IMAGE_NAME}"
           CHANGELOG_FILE="${RELEASE_DIR}/CHANGELOG.md"
           
+          git tag "${VERSION}"
           make check-release-tag
           make "${RELEASE_DIR}"
           make "${GORELEASER}"
-          
-          git checkout "${RELEASE_TAG}"
           
           make release-manifests
           make release-policies
