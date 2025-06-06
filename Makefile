@@ -563,8 +563,9 @@ list-image: ## List images for RELEASE_TAG
 	gcloud container images list-tags $(STAGING_REGISTRY)/$(IMAGE) --filter="tags=('$(RELEASE_TAG)')" --format=json
 
 .PHONY: release
-release: clean-release check-release-tag $(RELEASE_DIR) $(GORELEASER)  ## Builds and push container images using the latest git tag for the commit.
+release: clean-release check-release-tag check-release-branch $(RELEASE_DIR) $(GORELEASER)  ## Builds and push container images using the latest git tag for the commit.
 	git checkout "${RELEASE_TAG}"
+	$(MAKE) release-changelog
 	CORE_CONTROLLER_IMG=$(PROD_REGISTRY)/$(CORE_IMAGE_NAME) $(MAKE) release-manifests
 	$(MAKE) release-policies
 	echo "Release ${RELEASE_TAG}" > $(RELEASE_DIR)/CHANGELOG.md
