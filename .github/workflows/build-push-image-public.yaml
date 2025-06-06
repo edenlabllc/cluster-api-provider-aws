@@ -83,7 +83,7 @@ jobs:
           export CORE_CONTROLLER_IMG="${ECR_REPOSITORY}/${IMAGE_NAME}"
           CHANGELOG_FILE="${RELEASE_DIR}/CHANGELOG.md"
           
-          git tag "${VERSION}"
+          git tag -m "${VERSION}" "${VERSION}"
           make check-release-tag
           make "${RELEASE_DIR}"
           make "${GORELEASER}"
@@ -92,5 +92,5 @@ jobs:
           make release-manifests
           make release-policies
           
-          echo "Release ${RELEASE_TAG}" > "${CHANGELOG_FILE}"
+          echo "Release ${VERSION}" > "${CHANGELOG_FILE}"
           "${GORELEASER}" release --config "${GORELEASER_CONFIG}" --release-notes "${CHANGELOG_FILE}" --clean
