@@ -207,8 +207,18 @@ func (s *NodegroupService) createNodegroup() (*eks.Nodegroup, error) {
 		return nil, fmt.Errorf("failed getting nodegroup subnets: %w", err)
 	}
 
+	scalingConfig := s.scalingConfig()
+	// Initially set DesiredSize and MinSize to 0 to create an empty ASG,
+	// allowing reconcileASGTags() to attach all necessary EC2 instance tags
+	// before any instances are launched.
+	// Subsequent reconciliations will restore the original values from the
+	// MachinePool and AWSManagedMachinePool Kubernetes resources,
+	// ensuring the ASG creates instances with the correct tags.
+	scalingConfig.DesiredSize = aws.Int64(0)
+	scalingConfig.MinSize = aws.Int64(0)
+
 	input := &eks.CreateNodegroupInput{
-		ScalingConfig: s.scalingConfig(),
+		ScalingConfig: scalingConfig,
 		ClusterName:   aws.String(eksClusterName),
 		NodegroupName: aws.String(nodegroupName),
 		Subnets:       aws.StringSlice(subnets),
