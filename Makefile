@@ -568,7 +568,6 @@ release: clean-release check-release-tag check-release-branch $(RELEASE_DIR) $(G
 	$(MAKE) release-changelog
 	CORE_CONTROLLER_IMG=$(PROD_REGISTRY)/$(CORE_IMAGE_NAME) $(MAKE) release-manifests
 	$(MAKE) release-policies
-	echo "Release ${RELEASE_TAG}" > $(RELEASE_DIR)/CHANGELOG.md
 	$(GORELEASER) release --config $(GORELEASER_CONFIG) --release-notes $(RELEASE_DIR)/CHANGELOG.md --clean
 
 release-policies: $(RELEASE_POLICIES) ## Release policies
