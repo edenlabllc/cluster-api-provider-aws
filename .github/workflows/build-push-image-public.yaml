@@ -79,8 +79,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # generate additional release assets and save them to local directories
-
           # export vars required by Makefile
           export CORE_CONTROLLER_IMG="${ECR_REPOSITORY}/${IMAGE_NAME}"
           CHANGELOG_FILE="${RELEASE_DIR}/CHANGELOG.md"
@@ -90,6 +88,7 @@ jobs:
           make "${RELEASE_DIR}"
           make "${GORELEASER}"
           
+          # generate additional release assets and save them to local directories
           make release-manifests
           make release-policies
           
