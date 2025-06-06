@@ -61,4 +61,4 @@ release:
   extra_files:
     - glob: ./templates/*.yaml
     - glob: ./out/*
-  draft: true
+  draft: false
