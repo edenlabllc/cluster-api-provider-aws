@@ -85,7 +85,7 @@ jobs:
           export CORE_CONTROLLER_IMG="${ECR_REPOSITORY}/${IMAGE_NAME}"
           CHANGELOG_FILE="${RELEASE_DIR}/CHANGELOG.md"
           
-          # prepare git
+          # prepare Git
           git config user.name "${GIT_USERNAME}"
           git config user.email "${GIT_EMAIL}"
           git tag -m "${VERSION}" "${VERSION}"
