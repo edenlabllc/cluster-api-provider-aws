@@ -22,6 +22,22 @@
 
 Kubernetes-native declarative infrastructure for AWS.
 
+## Changes by Edenlab LLC
+
+This fork by [Edenlab LLC](https://edenlab.io/) modifies nodegroup creation logic 
+to **initially create empty Auto Scaling Groups (ASGs)**. This ensures that EC2 instance tags are fully reconciled 
+before any instances are launched.  
+It also adds GitHub Actions [workflows](.github/workflows) to build and publish Docker images.
+
+Images are published to the public ECR gallery:  
+[public.ecr.aws/edenlabllc/core.cluster-api-provider-aws](https://gallery.ecr.aws/edenlabllc/core.cluster-api-provider-aws)
+
+Changes are made in the [release-2.8](https://github.com/edenlabllc/cluster-api-provider-aws/tree/release-2.8) branch
+and released under the
+[v2.8.3](https://github.com/edenlabllc/cluster-api-provider-aws/releases/tag/v2.8.3) tag.
+
+See [edenlabllc/cluster-api-provider-aws#1](https://github.com/edenlabllc/cluster-api-provider-aws/pull/1) for details.
+
 ## What is the Cluster API Provider AWS
 
 The [Cluster API][cluster_api] brings
