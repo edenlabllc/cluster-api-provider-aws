@@ -214,8 +214,19 @@ func (s *NodegroupService) createNodegroup(ctx context.Context) (*ekstypes.Nodeg
 	if err != nil {
 		return nil, fmt.Errorf("failed creating nodegroup, invalid update config: %w", err)
 	}
+
+	scalingConfig := s.scalingConfig()
+	// Initially set DesiredSize and MinSize to 0 to create an empty ASG,
+	// allowing reconcileASGTags() to attach all necessary EC2 instance tags
+	// before any instances are launched.
+	// Subsequent reconciliations will restore the original values from the
+	// MachinePool and AWSManagedMachinePool Kubernetes resources,
+	// ensuring the ASG creates instances with the correct tags.
+	scalingConfig.DesiredSize = aws.Int32(0)
+	scalingConfig.MinSize = aws.Int32(0)
+
 	input := &eks.CreateNodegroupInput{
-		ScalingConfig: s.scalingConfig(),
+		ScalingConfig: scalingConfig,
 		ClusterName:   aws.String(eksClusterName),
 		NodegroupName: aws.String(nodegroupName),
 		Subnets:       subnets,

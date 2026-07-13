@@ -1,0 +1,83 @@
+name: Build and push Docker image to ECR (private)
+
+on:
+  push:
+    branches:
+      - release/v*
+      - feature/*
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: 288509344804.dkr.ecr.eu-north-1.amazonaws.com
+  IMAGE_ARCH: amd64
+  IMAGE_NAME: core.cluster-api-provider-aws
+
+jobs:
+  ci:
+    name: Build and push Docker image to ECR
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout main repository
+        uses: actions/checkout@v4
+        with:
+          # fetch all history for all branches and tags (custom)
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.CORE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.CORE_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Parse release version from Git commit message
+        run: |
+          readonly VERSION_REGEX="v[0-9]+\.[0-9]+\.[0-9]+"
+          
+          # sort all Git tags DESC by creation date and selected tags like vN.N.N
+          VERSION_PREV="$(git for-each-ref --sort=creatordate --format "%(refname:lstrip=2)" refs/tags | grep -E "^${VERSION_REGEX}$" | tail -1)"
+          
+          if [[ -z "${VERSION_PREV}" ]]; then
+            >&2 echo "At least one version is required in the repository."
+            >&2 echo "Tag a Git commit of the master branch manually before running the workflow."
+            exit 1
+          fi
+          
+          readonly GIT_BRANCH="${GITHUB_REF#refs/heads/}"
+  
+          # append short revision hash (equivalent to "git rev-parse --short HEAD")
+          # append branch name (strip special characters)
+          # NOTE: a tag name must be valid ASCII and may contain lowercase and uppercase letters, digits, underscores, periods and dashes,
+          #       may not start with a period or a dash and may contain a maximum of 128 characters
+          GIT_BRANCH_SANITIZED="${GIT_BRANCH}"
+          GIT_BRANCH_SANITIZED="${GIT_BRANCH_SANITIZED//\//-}"
+          GIT_BRANCH_SANITIZED="${GIT_BRANCH_SANITIZED//_/-}"
+          VERSION="${VERSION_PREV}-${GITHUB_SHA:0:7}-${GIT_BRANCH_SANITIZED}"
+          VERSION="${VERSION:0:128}"
+          VERSION="${VERSION%-}"
+          
+          # export vars required by the next steps
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: private
+
+      - name: Build and push Docker image
+        run: |
+          # export vars required by Makefile
+          export CORE_CONTROLLER_IMG="${ECR_REPOSITORY}/${IMAGE_NAME}"
+          export ARCH="${IMAGE_ARCH}"
+          export TAG="${VERSION}"
+          
+          make docker-build
+
+          readonly SOURCE_IMAGE="${ECR_REPOSITORY}/${IMAGE_NAME}-${IMAGE_ARCH}:${VERSION}"
+          readonly TARGET_IMAGE="${ECR_REPOSITORY}/${IMAGE_NAME}:${VERSION}"
+          docker tag "${SOURCE_IMAGE}" "${TARGET_IMAGE}"
+          docker push "${TARGET_IMAGE}"
