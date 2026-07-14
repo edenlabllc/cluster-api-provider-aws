@@ -22,6 +22,21 @@
 
 Kubernetes-native declarative infrastructure for AWS.
 
+## Changes by Edenlab LLC
+
+This fork by [Edenlab LLC](https://edenlab.io/) includes the following changes on top of upstream CAPA:
+
+- **EKS managed node group ASG tags:** nodegroup creation initially sets `DesiredSize` and `MinSize` to `0` so an empty ASG is created first. That allows `reconcileASGTags()` to attach EC2 instance tags (with `PropagateAtLaunch`) before any instances are launched. Later reconciles restore the intended scaling from the MachinePool / AWSManagedMachinePool specs.
+- **Single NAT for all private subnets:** optional `spec.network.vpc.singleNatGateway: true` on `AWSCluster` / `AWSManagedControlPlane`. When set, multiple AZs / private subnets share one NAT gateway (first public subnet). Omitted or `false` keeps upstream behavior (one NAT per AZ). Tradeoff when enabled: lower cost, but private egress is not AZ-HA and cross-AZ NAT traffic may incur data-transfer charges. Existing NAT layouts are not auto-migrated when the flag changes.
+- **Release tooling:** GitHub Actions [workflows](.github/workflows) to build and publish Docker images.
+
+Images are published to the public ECR gallery:
+[public.ecr.aws/edenlabllc/core.cluster-api-provider-aws](https://gallery.ecr.aws/edenlabllc/core.cluster-api-provider-aws)
+
+Changes are made in the [release-2.12](https://github.com/edenlabllc/cluster-api-provider-aws/tree/release-2.12) branch
+and released under the
+[v2.12.2](https://github.com/edenlabllc/cluster-api-provider-aws/releases/tag/v2.12.2) tag.
+
 ## What is the Cluster API Provider AWS
 
 The [Cluster API][cluster_api] brings

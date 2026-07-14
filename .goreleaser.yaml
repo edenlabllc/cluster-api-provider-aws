@@ -58,8 +58,14 @@ archives:
   formats: ["binary"]
 
 release:
-  discussion_category_name: General
+  # Do not open a GitHub Discussions thread for each release.
+  # Upstream sets discussion_category_name: General; that fails (or is noisy) on
+  # forks where Discussions are disabled or the category is missing.
+  # discussion_category_name: General
   extra_files:
     - glob: ./templates/*.yaml
     - glob: ./out/*
-  draft: true
+  # Publish releases immediately from the build-push-image-public workflow.
+  # Upstream uses draft: true (manual publish). draft: false matches our automated
+  # tag + Goreleaser flow after merging release/vX.Y.Z into release-*.
+  draft: false

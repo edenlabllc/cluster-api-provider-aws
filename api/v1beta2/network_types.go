@@ -580,6 +580,12 @@ type VPCSpec struct {
 	// +kubebuilder:default=PreferPrivate
 	// +kubebuilder:validation:Enum=PreferPrivate;PreferPublic
 	SubnetSchema *SubnetSchemaType `json:"subnetSchema,omitempty"`
+
+	// SingleNatGateway when true creates one NAT gateway shared by all private subnets (cost-saving).
+	// When false or omitted (default), creates one NAT gateway per AZ with private subnets (upstream HA behavior).
+	// Only applies to managed VPCs. Existing NAT layouts are not automatically migrated when this value changes.
+	// +optional
+	SingleNatGateway bool `json:"singleNatGateway,omitempty"`
 }
 
 // String returns a string representation of the VPC.

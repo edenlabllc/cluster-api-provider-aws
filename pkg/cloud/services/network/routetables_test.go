@@ -301,6 +301,7 @@ func TestReconcileRouteTables(t *testing.T) {
 			},
 		},
 		{
+			// Upstream: private in 1a cannot use NAT living only in 1b when SingleNatGateway is false.
 			name: "subnets in different availability zones, returns error",
 			input: &infrav1.NetworkSpec{
 				VPC: infrav1.VPCSpec{
@@ -329,6 +330,73 @@ func TestReconcileRouteTables(t *testing.T) {
 					Return(&ec2.DescribeRouteTablesOutput{}, nil)
 			},
 			err: errors.New(`no nat gateways available in "us-east-1a"`),
+		},
+		{
+			// With SingleNatGateway=true, private RT in 1a may use the NAT in 1b
+			// (cross-AZ fallback in getNatGatewayForSubnet).
+			name: "subnets in different availability zones with singleNatGateway, uses shared NAT",
+			input: &infrav1.NetworkSpec{
+				VPC: infrav1.VPCSpec{
+					InternetGatewayID: aws.String("igw-01"),
+					ID:                "vpc-routetables",
+					SingleNatGateway:  true,
+					Tags: infrav1.Tags{
+						infrav1.ClusterTagKey("test-cluster"): "owned",
+					},
+				},
+				Subnets: infrav1.Subnets{
+					infrav1.SubnetSpec{
+						ID:               "subnet-routetables-private",
+						IsPublic:         false,
+						AvailabilityZone: "us-east-1a",
+					},
+					infrav1.SubnetSpec{
+						ID:               "subnet-routetables-public",
+						IsPublic:         true,
+						NatGatewayID:     aws.String("nat-01"),
+						AvailabilityZone: "us-east-1b",
+					},
+				},
+			},
+			expect: func(m *mocks.MockEC2APIMockRecorder) {
+				m.DescribeRouteTables(context.TODO(), gomock.AssignableToTypeOf(&ec2.DescribeRouteTablesInput{})).
+					Return(&ec2.DescribeRouteTablesOutput{}, nil)
+
+				privateRouteTable := m.CreateRouteTable(context.TODO(), matchRouteTableInput(&ec2.CreateRouteTableInput{VpcId: aws.String("vpc-routetables")})).
+					Return(&ec2.CreateRouteTableOutput{RouteTable: &types.RouteTable{RouteTableId: aws.String("rt-1")}}, nil)
+
+				// Private subnet is in 1a; NatGatewayId nat-01 lives on the public subnet in 1b.
+				m.CreateRoute(context.TODO(), gomock.Eq(&ec2.CreateRouteInput{
+					NatGatewayId:         aws.String("nat-01"),
+					DestinationCidrBlock: aws.String("0.0.0.0/0"),
+					RouteTableId:         aws.String("rt-1"),
+				})).
+					After(privateRouteTable)
+
+				m.AssociateRouteTable(context.TODO(), gomock.Eq(&ec2.AssociateRouteTableInput{
+					RouteTableId: aws.String("rt-1"),
+					SubnetId:     aws.String("subnet-routetables-private"),
+				})).
+					Return(&ec2.AssociateRouteTableOutput{}, nil).
+					After(privateRouteTable)
+
+				publicRouteTable := m.CreateRouteTable(context.TODO(), matchRouteTableInput(&ec2.CreateRouteTableInput{VpcId: aws.String("vpc-routetables")})).
+					Return(&ec2.CreateRouteTableOutput{RouteTable: &types.RouteTable{RouteTableId: aws.String("rt-2")}}, nil)
+
+				m.CreateRoute(context.TODO(), gomock.Eq(&ec2.CreateRouteInput{
+					GatewayId:            aws.String("igw-01"),
+					DestinationCidrBlock: aws.String("0.0.0.0/0"),
+					RouteTableId:         aws.String("rt-2"),
+				})).
+					After(publicRouteTable)
+
+				m.AssociateRouteTable(context.TODO(), gomock.Eq(&ec2.AssociateRouteTableInput{
+					RouteTableId: aws.String("rt-2"),
+					SubnetId:     aws.String("subnet-routetables-public"),
+				})).
+					Return(&ec2.AssociateRouteTableOutput{}, nil).
+					After(publicRouteTable)
+			},
 		},
 		{
 			name: "routes exist, but the nat gateway ID is incorrect, replaces it",
@@ -1009,10 +1077,14 @@ func TestService_getRoutesForSubnet(t *testing.T) {
 			wantErrMessage: `no nat gateways available in "" for private subnet "subnet-1-private"`,
 		},
 		{
-			name:           "empty subnet should have empty routes",
-			inputSubnet:    &infrav1.SubnetSpec{},
-			want:           []*ec2.CreateRouteInput{},
-			wantErrMessage: `no nat gateways available in "" for private subnet ""`,
+			// Require an empty subnet list so getNatGatewayForSubnet cannot fall
+			// back to a NAT from defaultNetwork (needed so the error path stays valid if
+			// SingleNatGateway or edge-style fallback is enabled).
+			name:                "empty subnet with no available NATs should error",
+			specOverrideSubnets: &infrav1.Subnets{},
+			inputSubnet:         &infrav1.SubnetSpec{},
+			want:                []*ec2.CreateRouteInput{},
+			wantErrMessage:      `no nat gateways available in "" for private subnet ""`,
 		},
 		// public subnets ipv4
 		{
@@ -1265,11 +1337,14 @@ func TestService_getRoutesForSubnet(t *testing.T) {
 		},
 		// private subnet, gateway not found
 		{
+			// Clear NatGatewayID on *all* public subnets (not only us-east-1a).
+			// If any other AZ still has a NAT, SingleNatGateway / edge fallback would pick
+			// it up and this case would no longer error as intended.
 			name: "private ipv4 subnet, availability zone, must return error when invalid gateway",
 			specOverrideNet: func() *infrav1.NetworkSpec {
 				net := defaultNetwork.DeepCopy()
 				for i := range net.Subnets {
-					if net.Subnets[i].AvailabilityZone == "us-east-1a" && net.Subnets[i].IsPublic {
+					if net.Subnets[i].IsPublic {
 						net.Subnets[i].NatGatewayID = nil
 					}
 				}

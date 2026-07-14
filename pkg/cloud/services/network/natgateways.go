@@ -115,6 +115,12 @@ func (s *Service) updateNatGatewayIPs(updateTags bool) ([]string, error) {
 	natGatewaysIPs := []string{}
 	subnetIDs := []string{}
 
+	// SingleNatGateway=true → one shared NAT for all private subnets (see updateNatGatewayIPsSingle).
+	// Default/false: one NAT per AZ. Flag changes do not migrate an existing NAT layout.
+	if s.scope.VPC().SingleNatGateway {
+		return s.updateNatGatewayIPsSingle(existing, updateTags)
+	}
+
 	// Find AZs that have private subnets
 	privateSubnetAZs := make(map[string]bool)
 	for _, sn := range s.scope.Subnets().FilterPrivate().FilterNonCni() {
@@ -161,6 +167,79 @@ func (s *Service) updateNatGatewayIPs(updateTags bool) ([]string, error) {
 		}
 
 		subnetIDs = append(subnetIDs, sn.GetResourceID())
+	}
+
+	s.scope.SetNatGatewaysIPs(natGatewaysIPs)
+	return subnetIDs, nil
+}
+
+// updateNatGatewayIPsSingle implements SingleNatGateway: one NAT per VPC (cost vs AZ HA).
+// Reuses any existing public-subnet NAT; otherwise creates one in the first public
+// NonCNI subnet after sorting by AZ then subnet ID. Returns 0 or 1 subnet ID for createNatGateways.
+// Private RTs attach later via getNatGatewayForSubnet.
+func (s *Service) updateNatGatewayIPsSingle(existing map[string]types.NatGateway, updateTags bool) ([]string, error) {
+	natGatewaysIPs := []string{}
+	subnetIDs := []string{}
+
+	// No private subnets → nothing to NAT for.
+	if len(s.scope.Subnets().FilterPrivate().FilterNonCni()) == 0 {
+		s.scope.SetNatGatewaysIPs(natGatewaysIPs)
+		return subnetIDs, nil
+	}
+
+	// Candidate public subnets for hosting the shared NAT (NonCNI only).
+	publicSubnets := s.scope.Subnets().FilterPublic().FilterNonCni()
+
+	// Stable order (AZ, then subnet ID) so create placement does not flip across reconciles.
+	sort.SliceStable(publicSubnets, func(i, j int) bool {
+		if publicSubnets[i].AvailabilityZone == publicSubnets[j].AvailabilityZone {
+			return publicSubnets[i].GetResourceID() < publicSubnets[j].GetResourceID()
+		}
+		return publicSubnets[i].AvailabilityZone < publicSubnets[j].AvailabilityZone
+	})
+
+	// Prefer first existing NAT; else remember first public subnet as the create target.
+	var existingNGW *types.NatGateway
+	createOnSubnetID := ""
+	for _, sn := range publicSubnets {
+		if sn.GetResourceID() == "" {
+			continue
+		}
+		if ngw, ok := existing[sn.GetResourceID()]; ok {
+			existingNGW = &ngw
+			break // ignore extra NATs (e.g. leftover per-AZ layout)
+		}
+		if createOnSubnetID == "" {
+			createOnSubnetID = sn.GetResourceID()
+		}
+	}
+
+	// Reuse path: record IP, optionally refresh tags, skip create.
+	if existingNGW != nil {
+		if len(existingNGW.NatGatewayAddresses) > 0 && existingNGW.NatGatewayAddresses[0].PublicIp != nil {
+			natGatewaysIPs = append(natGatewaysIPs, *existingNGW.NatGatewayAddresses[0].PublicIp)
+		}
+		if updateTags {
+			if err := wait.WaitForWithRetryable(wait.NewBackoff(), func() (bool, error) {
+				buildParams := s.getNatGatewayTagParams(*existingNGW.NatGatewayId)
+				tagsBuilder := tags.New(&buildParams, tags.WithEC2(s.EC2Client))
+				if err := tagsBuilder.Ensure(converters.TagsToMap(existingNGW.Tags)); err != nil {
+					return false, err
+				}
+				return true, nil
+			}, awserrors.ResourceNotFound); err != nil {
+				record.Warnf(s.scope.InfraCluster(), "FailedTagNATGateway", "Failed to tag managed NAT Gateway %q: %v", *existingNGW.NatGatewayId, err)
+				return nil, errors.Wrapf(err, "failed to tag nat gateway %q", *existingNGW.NatGatewayId)
+			}
+		}
+		s.scope.SetNatGatewaysIPs(natGatewaysIPs)
+		return subnetIDs, nil // empty → skip CreateNatGateway
+	}
+
+	// Create path: ask caller to build one NAT on the chosen public subnet.
+	if createOnSubnetID != "" {
+		s.scope.Info("Using single shared NAT gateway for all private subnets", "subnet-id", createOnSubnetID)
+		subnetIDs = append(subnetIDs, createOnSubnetID)
 	}
 
 	s.scope.SetNatGatewaysIPs(natGatewaysIPs)
@@ -359,16 +438,14 @@ func (s *Service) deleteNatGateway(id string) error {
 	return nil
 }
 
-// getNatGatewayForSubnet return the nat gateway for private subnets.
-// NAT gateways in edge zones (Local Zones) are not globally supported,
-// private subnets in those locations uses Nat Gateways from the
-// Parent Zone or, when not available, the first zone in the Region.
+// getNatGatewayForSubnet picks the NAT for a private subnet's 0.0.0.0/0 route:
+// same-AZ, then parent zone (edge), then any AZ if edge or SingleNatGateway.
+// Without SingleNatGateway, a non-edge subnet with no same-AZ NAT errors.
 func (s *Service) getNatGatewayForSubnet(sn *infrav1.SubnetSpec) (string, error) {
 	if sn.IsPublic {
 		return "", errors.Errorf("cannot get NAT gateway for a public subnet, got id %q", sn.GetResourceID())
 	}
 
-	// Check if public edge subnet in the edge zone has nat gateway
 	azGateways := make(map[string]string)
 	azNames := []string{}
 	for _, psn := range s.scope.Subnets().FilterPublic() {
@@ -385,29 +462,28 @@ func (s *Service) getNatGatewayForSubnet(sn *infrav1.SubnetSpec) (string, error)
 		return gws, nil
 	}
 
-	// return error when no gateway found for regular zones, availability-zone zone type.
-	if !sn.IsEdge() {
-		return "", errors.Errorf("no nat gateways available in %q for private subnet %q", sn.AvailabilityZone, sn.GetResourceID())
-	}
-
-	// edge zones only: trying to find nat gateway for Local or Wavelength zone based in the zone type.
-
-	// Check if the parent zone public subnet has nat gateway
+	// Prefer parent-zone NAT for edge zones when available.
 	if sn.ParentZoneName != nil {
 		if gws, ok := azGateways[aws.ToString(sn.ParentZoneName)]; ok && len(gws) > 0 {
 			return gws, nil
 		}
 	}
 
-	// Get the first public subnet's nat gateway available
-	sort.Strings(azNames)
-	for _, zone := range azNames {
-		gw := azGateways[zone]
-		if len(gw) > 0 {
-			s.scope.Debug("Assigning route table", "table ID", gw, "source zone", zone, "target zone", sn.AvailabilityZone)
-			return gw, nil
+	// Cross-AZ fallback: edge zones, or SingleNatGateway shared NAT.
+	allowCrossAZFallback := sn.IsEdge() || s.scope.VPC().SingleNatGateway
+	if allowCrossAZFallback {
+		sort.Strings(azNames)
+		for _, zone := range azNames {
+			gw := azGateways[zone]
+			if len(gw) > 0 {
+				s.scope.Debug("Assigning shared NAT gateway", "nat-gateway-id", gw, "source-zone", zone, "target-zone", sn.AvailabilityZone)
+				return gw, nil
+			}
 		}
 	}
 
-	return "", errors.Errorf("no nat gateways available in %q for private edge subnet %q, current state: %+v", sn.AvailabilityZone, sn.GetResourceID(), azGateways)
+	if sn.IsEdge() {
+		return "", errors.Errorf("no nat gateways available in %q for private edge subnet %q, current state: %+v", sn.AvailabilityZone, sn.GetResourceID(), azGateways)
+	}
+	return "", errors.Errorf("no nat gateways available in %q for private subnet %q", sn.AvailabilityZone, sn.GetResourceID())
 }
