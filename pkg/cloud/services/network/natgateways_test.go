@@ -46,8 +46,8 @@ func TestReconcileNatGateways(t *testing.T) {
 	defer mockCtrl.Finish()
 
 	testCases := []struct {
-		name   string
-		input  []infrav1.SubnetSpec
+		name  string
+		input []infrav1.SubnetSpec
 		// When true, AWSCluster.spec.network.vpc.singleNatGateway is set so
 		// reconcile creates one shared NAT instead of one per AZ.
 		singleNatGateway bool
