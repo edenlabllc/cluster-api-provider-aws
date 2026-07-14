@@ -46,10 +46,12 @@ func TestReconcileNatGateways(t *testing.T) {
 	defer mockCtrl.Finish()
 
 	testCases := []struct {
-		name              string
-		input             []infrav1.SubnetSpec
-		singleNatGateway  bool
-		expect            func(m *mocks.MockEC2APIMockRecorder)
+		name   string
+		input  []infrav1.SubnetSpec
+		// When true, AWSCluster.spec.network.vpc.singleNatGateway is set so
+		// reconcile creates one shared NAT instead of one per AZ.
+		singleNatGateway bool
+		expect           func(m *mocks.MockEC2APIMockRecorder)
 	}{
 		{
 			name: "single private subnet exists, should create no NAT gateway",
@@ -250,6 +252,8 @@ func TestReconcileNatGateways(t *testing.T) {
 			},
 		},
 		{
+			// Upstream default (singleNatGateway omitted/false): one NAT in each AZ
+			// that has both a public subnet and private subnets.
 			name: "multiple AZs with private subnets, should create one NAT gateway per AZ",
 			input: []infrav1.SubnetSpec{
 				{
@@ -361,6 +365,8 @@ func TestReconcileNatGateways(t *testing.T) {
 			},
 		},
 		{
+			// SingleNatGateway=true: despite private subnets in two AZs, only
+			// one CreateNatGateway/AllocateAddress is expected (public subnet in 1a).
 			name:             "multiple AZs with singleNatGateway, should create a single shared NAT gateway",
 			singleNatGateway: true,
 			input: []infrav1.SubnetSpec{
@@ -408,6 +414,7 @@ func TestReconcileNatGateways(t *testing.T) {
 				m.DescribeAddresses(context.TODO(), gomock.Any()).
 					Return(&ec2.DescribeAddressesOutput{}, nil)
 
+				// Times(1) is the assertion — per-AZ mode would Allocate/Create twice.
 				m.AllocateAddress(context.TODO(), &ec2.AllocateAddressInput{
 					Domain: types.DomainTypeVpc,
 					TagSpecifications: []types.TagSpecification{
@@ -433,6 +440,7 @@ func TestReconcileNatGateways(t *testing.T) {
 					AllocationId: aws.String(ElasticIPAllocationID),
 				}, nil).Times(1)
 
+				// Created on subnet-1 (us-east-1a): first public subnet after AZ+ID sort.
 				m.CreateNatGateway(context.TODO(), gomock.Any()).
 					Return(&ec2.CreateNatGatewayOutput{
 						NatGateway: &types.NatGateway{
@@ -548,6 +556,7 @@ func TestReconcileNatGateways(t *testing.T) {
 							Tags: infrav1.Tags{
 								infrav1.ClusterTagKey("test-cluster"): "owned",
 							},
+							// Drive SingleNatGateway code paths from the table flag above.
 							SingleNatGateway: tc.singleNatGateway,
 						},
 						Subnets: tc.input,

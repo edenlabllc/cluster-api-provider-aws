@@ -115,11 +115,15 @@ func (s *Service) updateNatGatewayIPs(updateTags bool) ([]string, error) {
 	natGatewaysIPs := []string{}
 	subnetIDs := []string{}
 
+	// Optional cost-saving mode via VPCSpec.SingleNatGateway.
+	// - false / omitted (default): upstream behavior — one NAT per AZ that has private subnets.
+	// - true: create/reuse a single NAT shared by all private subnets (see updateNatGatewayIPsSingle).
+	// Only applies to managed VPCs; existing NAT layouts are not migrated when the flag changes.
 	if s.scope.VPC().SingleNatGateway {
 		return s.updateNatGatewayIPsSingle(existing, updateTags)
 	}
 
-	// Find AZs that have private subnets
+	// Upstream: Find AZs that have private subnets
 	privateSubnetAZs := make(map[string]bool)
 	for _, sn := range s.scope.Subnets().FilterPrivate().FilterNonCni() {
 		if sn.GetResourceID() != "" {
@@ -127,7 +131,7 @@ func (s *Service) updateNatGatewayIPs(updateTags bool) ([]string, error) {
 		}
 	}
 
-	// For each AZ with private subnets, find a public subnet and check for NAT gateway
+	// Upstream: For each AZ with private subnets, find a public subnet and check for NAT gateway
 	processedAZs := make(map[string]bool)
 	for _, sn := range s.scope.Subnets().FilterPublic().FilterNonCni() {
 		if sn.GetResourceID() == "" {
@@ -171,19 +175,27 @@ func (s *Service) updateNatGatewayIPs(updateTags bool) ([]string, error) {
 	return subnetIDs, nil
 }
 
-// updateNatGatewayIPsSingle creates/uses one NAT for all private subnets when
-// VPCSpec.SingleNatGateway is true.
+// updateNatGatewayIPsSingle implements SingleNatGateway mode.
+//
+// Goal: reduce NAT hourly/EIP cost by provisioning one NAT for the whole VPC
+// instead of one per AZ. Tradeoffs: private egress loses AZ HA (the NAT's AZ
+// is a SPOF) and cross-AZ data to the NAT may incur transfer charges.
+//
+// Placement: prefer any already-existing NAT on a public NonCNI subnet; otherwise
+// create exactly one NAT in the lexicographically first public NonCNI subnet
+// (sorted by AZ, then subnet ID) so placement is stable across reconciles.
+// Private route tables are wired to that NAT later via getNatGatewayForSubnet.
 func (s *Service) updateNatGatewayIPsSingle(existing map[string]types.NatGateway, updateTags bool) ([]string, error) {
 	natGatewaysIPs := []string{}
 	subnetIDs := []string{}
 
 	if len(s.scope.Subnets().FilterPrivate().FilterNonCni()) == 0 {
+		// No private egress needed → do not create a shared NAT either.
 		s.scope.SetNatGatewaysIPs(natGatewaysIPs)
 		return subnetIDs, nil
 	}
 
-	// Prefer an existing NAT on any public subnet; otherwise create one NAT in the
-	// lexicographically first public NonCNI subnet.
+	// Stable ordering so we always pick the same public subnet for a new NAT.
 	publicSubnets := s.scope.Subnets().FilterPublic().FilterNonCni()
 	sort.SliceStable(publicSubnets, func(i, j int) bool {
 		if publicSubnets[i].AvailabilityZone == publicSubnets[j].AvailabilityZone {
@@ -198,6 +210,7 @@ func (s *Service) updateNatGatewayIPsSingle(existing map[string]types.NatGateway
 		if sn.GetResourceID() == "" {
 			continue
 		}
+		// Reuse the first NAT we already own in any public subnet — do not create more.
 		if ngw, ok := existing[sn.GetResourceID()]; ok {
 			existingNGW = &ngw
 			break
@@ -225,11 +238,13 @@ func (s *Service) updateNatGatewayIPsSingle(existing map[string]types.NatGateway
 			}
 		}
 		s.scope.SetNatGatewaysIPs(natGatewaysIPs)
+		// Empty subnetIDs → reconcileNatGateways will not CreateNatGateway again.
 		return subnetIDs, nil
 	}
 
 	if createOnSubnetID != "" {
 		s.scope.Info("Using single shared NAT gateway for all private subnets", "subnet-id", createOnSubnetID)
+		// Returned to reconcileNatGateways → createNatGateways allocates one EIP and creates one NAT here.
 		subnetIDs = append(subnetIDs, createOnSubnetID)
 	}
 
@@ -429,12 +444,17 @@ func (s *Service) deleteNatGateway(id string) error {
 	return nil
 }
 
-// getNatGatewayForSubnet return the nat gateway for private subnets.
-// NAT gateways in edge zones (Local Zones) are not globally supported;
-// private subnets in those locations use Nat Gateways from the Parent Zone or,
-// when not available, the first zone in the Region.
-// When VPCSpec.SingleNatGateway is true, regular private subnets may also use
-// a NAT from another AZ (shared single NAT).
+// getNatGatewayForSubnet returns the NAT gateway ID to use for a private subnet's
+// default route (0.0.0.0/0). Selection order:
+//
+//  1. Same-AZ public NAT (always preferred when present).
+//  2. Parent-zone NAT (edge / Local / Wavelength zones).
+//  3. Cross-AZ fallback to any available public NAT — only when:
+//     - the subnet is an edge zone (upstream behavior; edge AZs often have no local NAT), or
+//     - VPCSpec.SingleNatGateway is true (all private RTs share one VPC NAT).
+//
+// When SingleNatGateway is false/omitted, a regular (non-edge) private subnet with
+// no NAT in its AZ returns an error — matching upstream HA assumptions.
 func (s *Service) getNatGatewayForSubnet(sn *infrav1.SubnetSpec) (string, error) {
 	if sn.IsPublic {
 		return "", errors.Errorf("cannot get NAT gateway for a public subnet, got id %q", sn.GetResourceID())
@@ -463,6 +483,7 @@ func (s *Service) getNatGatewayForSubnet(sn *infrav1.SubnetSpec) (string, error)
 		}
 	}
 
+	// SingleNatGateway extends cross-AZ NAT reuse to regular AZs as well as edge.
 	allowCrossAZFallback := sn.IsEdge() || s.scope.VPC().SingleNatGateway
 	if allowCrossAZFallback {
 		sort.Strings(azNames)

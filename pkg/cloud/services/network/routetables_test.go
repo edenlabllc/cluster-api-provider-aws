@@ -301,6 +301,7 @@ func TestReconcileRouteTables(t *testing.T) {
 			},
 		},
 		{
+			// Upstream: private in 1a cannot use NAT living only in 1b when SingleNatGateway is false.
 			name: "subnets in different availability zones, returns error",
 			input: &infrav1.NetworkSpec{
 				VPC: infrav1.VPCSpec{
@@ -331,6 +332,8 @@ func TestReconcileRouteTables(t *testing.T) {
 			err: errors.New(`no nat gateways available in "us-east-1a"`),
 		},
 		{
+			// With SingleNatGateway=true, private RT in 1a may use the NAT in 1b
+			// (cross-AZ fallback in getNatGatewayForSubnet).
 			name: "subnets in different availability zones with singleNatGateway, uses shared NAT",
 			input: &infrav1.NetworkSpec{
 				VPC: infrav1.VPCSpec{
@@ -362,6 +365,7 @@ func TestReconcileRouteTables(t *testing.T) {
 				privateRouteTable := m.CreateRouteTable(context.TODO(), matchRouteTableInput(&ec2.CreateRouteTableInput{VpcId: aws.String("vpc-routetables")})).
 					Return(&ec2.CreateRouteTableOutput{RouteTable: &types.RouteTable{RouteTableId: aws.String("rt-1")}}, nil)
 
+				// Private subnet is in 1a; NatGatewayId nat-01 lives on the public subnet in 1b.
 				m.CreateRoute(context.TODO(), gomock.Eq(&ec2.CreateRouteInput{
 					NatGatewayId:         aws.String("nat-01"),
 					DestinationCidrBlock: aws.String("0.0.0.0/0"),
@@ -1073,6 +1077,9 @@ func TestService_getRoutesForSubnet(t *testing.T) {
 			wantErrMessage: `no nat gateways available in "" for private subnet "subnet-1-private"`,
 		},
 		{
+			// Require an empty subnet list so getNatGatewayForSubnet cannot fall
+			// back to a NAT from defaultNetwork (needed so the error path stays valid if
+			// SingleNatGateway or edge-style fallback is enabled).
 			name:                "empty subnet with no available NATs should error",
 			specOverrideSubnets: &infrav1.Subnets{},
 			inputSubnet:         &infrav1.SubnetSpec{},
@@ -1330,6 +1337,9 @@ func TestService_getRoutesForSubnet(t *testing.T) {
 		},
 		// private subnet, gateway not found
 		{
+			// Clear NatGatewayID on *all* public subnets (not only us-east-1a).
+			// If any other AZ still has a NAT, SingleNatGateway / edge fallback would pick
+			// it up and this case would no longer error as intended.
 			name: "private ipv4 subnet, availability zone, must return error when invalid gateway",
 			specOverrideNet: func() *infrav1.NetworkSpec {
 				net := defaultNetwork.DeepCopy()
