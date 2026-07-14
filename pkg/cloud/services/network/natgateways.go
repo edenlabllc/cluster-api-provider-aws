@@ -185,18 +185,41 @@ func (s *Service) updateNatGatewayIPs(updateTags bool) ([]string, error) {
 // create exactly one NAT in the lexicographically first public NonCNI subnet
 // (sorted by AZ, then subnet ID) so placement is stable across reconciles.
 // Private route tables are wired to that NAT later via getNatGatewayForSubnet.
+//
+// Contract with reconcileNatGateways / createNatGateways:
+//   - return value subnetIDs lists public subnet IDs that still need a NAT created.
+//     In this mode that list is either empty (NAT already present) or length 1.
+//   - natGatewaysIPs is persisted on the scope for status / callers that expose
+//     the shared NAT public IP; it is empty when creating for the first time
+//     (IP is unknown until CreateNatGateway completes on a later reconcile).
+//
+// existing is keyed by the public subnet ID where each NAT currently lives
+// (from describeNatGatewaysBySubnet). We never intentionally create a second NAT
+// while one already exists in this map for any public subnet we own.
 func (s *Service) updateNatGatewayIPsSingle(existing map[string]types.NatGateway, updateTags bool) ([]string, error) {
+	// Accumulator for public IPs of NATs we already have (usually 0 or 1 entry).
 	natGatewaysIPs := []string{}
+	// Subnet IDs where createNatGateways should place a new NAT; stay empty if we reuse.
 	subnetIDs := []string{}
 
+	// Same gate as upstream: with no private NonCNI subnets there is nothing to NAT for.
+	// Skip allocating a shared NAT (and EIP) that would sit unused.
 	if len(s.scope.Subnets().FilterPrivate().FilterNonCni()) == 0 {
-		// No private egress needed → do not create a shared NAT either.
+		// Still write an empty IP list so stale status from a previous layout is cleared.
 		s.scope.SetNatGatewaysIPs(natGatewaysIPs)
 		return subnetIDs, nil
 	}
 
-	// Stable ordering so we always pick the same public subnet for a new NAT.
+	// Candidates for hosting the shared NAT: public + NonCNI only.
+	// CNI / secondary ENI-style subnets are excluded so we do not place NAT where
+	// route-table ownership is atypical.
 	publicSubnets := s.scope.Subnets().FilterPublic().FilterNonCni()
+
+	// Deterministic order across reconciles and controller replicas.
+	// Primary key: AvailabilityZone (string sort, e.g. us-east-1a before us-east-1b).
+	// Secondary key: subnet resource ID, so multiple publics in one AZ stay stable.
+	// Without this, map/slice iteration order could flip createOnSubnetID between runs
+	// and churn NAT placement if we were always creating (reuse path avoids that once present).
 	sort.SliceStable(publicSubnets, func(i, j int) bool {
 		if publicSubnets[i].AvailabilityZone == publicSubnets[j].AvailabilityZone {
 			return publicSubnets[i].GetResourceID() < publicSubnets[j].GetResourceID()
@@ -204,26 +227,40 @@ func (s *Service) updateNatGatewayIPsSingle(existing map[string]types.NatGateway
 		return publicSubnets[i].AvailabilityZone < publicSubnets[j].AvailabilityZone
 	})
 
+	// Walk sorted public subnets once:
+	//  1) Prefer the first subnet that already has a NAT in `existing` → reuse path.
+	//  2) Else remember the first subnet that has a resource ID as createOnSubnetID.
+	// Subnets without an ID yet (not created in AWS) are skipped for both reuse and create.
 	var existingNGW *types.NatGateway
 	createOnSubnetID := ""
 	for _, sn := range publicSubnets {
 		if sn.GetResourceID() == "" {
+			// Spec-only stub; cannot attach or look up a NAT until EC2 has a subnet ID.
 			continue
 		}
-		// Reuse the first NAT we already own in any public subnet — do not create more.
 		if ngw, ok := existing[sn.GetResourceID()]; ok {
+			// Found a live NAT on this public subnet. Take the first hit in sorted order
+			// and stop: we deliberately ignore additional NATs (e.g. leftover from a prior
+			// per-AZ layout). Cleanup of extras is outside this function's scope.
 			existingNGW = &ngw
 			break
 		}
 		if createOnSubnetID == "" {
+			// First usable public subnet in sort order becomes the create target if
+			// no existing NAT was found later in the loop (we only set this once).
 			createOnSubnetID = sn.GetResourceID()
 		}
 	}
 
+	// --- Reuse path: a shared NAT already exists somewhere in the VPC ---
 	if existingNGW != nil {
+		// Record the Elastic IP / public address for cluster status when AWS has attached one.
+		// Pending NATs may briefly have empty NatGatewayAddresses; IPs update on next reconcile.
 		if len(existingNGW.NatGatewayAddresses) > 0 && existingNGW.NatGatewayAddresses[0].PublicIp != nil {
 			natGatewaysIPs = append(natGatewaysIPs, *existingNGW.NatGatewayAddresses[0].PublicIp)
 		}
+		// Tag sync mirrors the per-AZ updateNatGatewayIPs branch: keep cluster/role Name tags
+		// current without recreating the gateway. Skipped when updateTags is false (e.g. hot paths).
 		if updateTags {
 			if err := wait.WaitForWithRetryable(wait.NewBackoff(), func() (bool, error) {
 				buildParams := s.getNatGatewayTagParams(*existingNGW.NatGatewayId)
@@ -238,15 +275,20 @@ func (s *Service) updateNatGatewayIPsSingle(existing map[string]types.NatGateway
 			}
 		}
 		s.scope.SetNatGatewaysIPs(natGatewaysIPs)
-		// Empty subnetIDs → reconcileNatGateways will not CreateNatGateway again.
+		// Empty subnetIDs is the signal to the caller: do not call CreateNatGateway again.
+		// Private subnets in other AZs will still get 0.0.0.0/0 → this NAT via getNatGatewayForSubnet.
 		return subnetIDs, nil
 	}
 
+	// --- Create path: no NAT in `existing` for any public subnet we scanned ---
 	if createOnSubnetID != "" {
 		s.scope.Info("Using single shared NAT gateway for all private subnets", "subnet-id", createOnSubnetID)
-		// Returned to reconcileNatGateways → createNatGateways allocates one EIP and creates one NAT here.
+		// Exactly one subnet ID → createNatGateways allocates one EIP and creates one NAT
+		// in that public subnet. Subsequent reconciles hit the reuse path above.
 		subnetIDs = append(subnetIDs, createOnSubnetID)
 	}
+	// If createOnSubnetID stayed empty, every public subnet lacked a resource ID (or there
+	// were none): return empty subnetIDs and let subnet reconcile catch up first.
 
 	s.scope.SetNatGatewaysIPs(natGatewaysIPs)
 	return subnetIDs, nil
